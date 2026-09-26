@@ -546,9 +546,10 @@ def main_page() -> None:
                 with db.connect(settings.db_path) as metric_conn:
                     history = db.metric_history(metric_conn, ticker, field)
                 if len(history) < 2:
-                    ui.label("Not enough history yet for this metric (need 2+ runs).").classes(
-                        "text-sm text-gray-500"
-                    )
+                    ui.label(
+                        f"Not enough history yet for {db.METRIC_FIELDS[field]} "
+                        f"(have {len(history)}, need 2+ runs)."
+                    ).classes("text-sm text-gray-500")
                     return
                 df = pd.DataFrame(
                     {
@@ -619,6 +620,7 @@ def main_page() -> None:
         with detail_container:
             render_detail(row_data["ticker_run_id"], row_data["ticker"])
         drawer.value = True
+        ui.run_javascript(f"getHtmlElement({drawer.id}).scrollTop = 0")
 
     grid.on("cellClicked", lambda e: open_detail_panel(e.args["data"]))
 
