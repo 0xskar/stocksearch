@@ -109,3 +109,6 @@ ENV/
 
 # Machine-specific operating notes (absolute paths, service names) - not for the public repo
 instructions.md
+
+# Claude Code project config - not for the public repo
+.claude/
