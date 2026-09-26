@@ -286,6 +286,12 @@ def _run_job_sync(tickers: list[str]) -> None:
 
 @ui.page("/")
 def main_page() -> None:
+    # Lets the results grid grow to fill the rest of the viewport (via
+    # flex-grow) instead of sitting at a fixed height with empty page
+    # space below it - falls back to a normal scrolling page if the
+    # content above/below the grid ever needs more than one viewport.
+    ui.query(".nicegui-content").classes("h-screen")
+
     ui.label("📈 stocksearch").classes("text-2xl font-bold")
     ui.label("Agentic fundamentals + sentiment + demand research").classes("text-sm text-gray-500")
     activity_label = ui.label("").classes("text-sm text-gray-500 italic")
@@ -441,7 +447,7 @@ def main_page() -> None:
             "rowSelection": "single",
         },
         html_columns=[0],
-    ).classes("w-full h-96")
+    ).classes("w-full flex-grow min-h-96")
 
     drawer = ui.right_drawer(value=False, fixed=True, bordered=True).props(
         f"width={DRAWER_MAX_WIDTH}"
