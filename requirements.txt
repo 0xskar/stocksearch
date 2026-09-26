@@ -1,0 +1,11 @@
+requests==2.34.2
+ddgs==9.16.0
+yfinance==1.7.0
+finnhub-python==2.4.29
+praw==8.0.3
+python-dotenv==1.2.3
+tenacity==9.1.4
+nicegui==3.17.1
+pandas==2.3.3
+altair==6.2.2
+anywidget==0.11.0

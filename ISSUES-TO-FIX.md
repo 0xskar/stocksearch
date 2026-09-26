@@ -1,0 +1,6 @@
+- make the results not refresh consistently it looks ugly only make it refresh when there are updates
+- inside of the Details: html body.desktop.no-touch.body--light div#app div#c0.q-layout.q-layout--standard.nicegui-layout div.q-drawer-container aside.q-drawer.q-drawer--right.q-drawer--bordered.q-drawer--standard.fixed div#c47.q-drawer__content.fit.scroll.nicegui-drawer.overflow-x-hidden div#c53.nicegui-column.w-full.max-w-full nicegui-refreshable#c1422 nicegui-expansion#c1489.nicegui-expansion.w-full.max-w-full div#c1490.w-full.break-words the markdown isn't displaying properly and looks ugly
+- in the results under the ticker, the ticker symbols should have the name of the company or ETF there as well in small letts so it looks like by the ticket symbol i think
+- in the details panel: #c1715, and #c1717 (css id) when i think there is not enough history yet for a metric nothing displays, but it just looks blank, can there be a message while a ticket has not enough history yet to display things?
+- rename this project and everything in it to "stocksearch"
+- prepare to submit this to my git at git@github.com:0xskar/stocksearch.git so we need a proper readme that stays updates and make sure there is no sensitive information, or we keep this as a development version and make another version for git? I dont want to keep secrets on github.
