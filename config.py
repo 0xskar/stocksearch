@@ -29,6 +29,9 @@ class Settings:
     ticker_pause_seconds: float = 2.0
     log_path: str = "./logs/stocksearch.log"
     log_level: str = "INFO"
+    storage_secret: str = "change-me-please"
+    overnight_scan_enabled: bool = False
+    overnight_scan_time: str = "02:00"
 
     @property
     def reddit_configured(self) -> bool:
@@ -56,4 +59,7 @@ def load_settings() -> Settings:
         ticker_pause_seconds=float(os.environ.get("TICKER_PAUSE_SECONDS", "2")),
         log_path=os.environ.get("STOCKSEARCH_LOG_PATH", "./logs/stocksearch.log"),
         log_level=os.environ.get("LOG_LEVEL", "INFO"),
+        storage_secret=os.environ.get("STOCKSEARCH_STORAGE_SECRET", "change-me-please"),
+        overnight_scan_enabled=os.environ.get("OVERNIGHT_SCAN_ENABLED", "false").lower() == "true",
+        overnight_scan_time=os.environ.get("OVERNIGHT_SCAN_TIME", "02:00"),
     )

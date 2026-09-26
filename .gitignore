@@ -112,3 +112,6 @@ instructions.md
 
 # Claude Code project config - not for the public repo
 .claude/
+
+# Personal scratch notes, not for the public repo
+.improvements-to-make.md

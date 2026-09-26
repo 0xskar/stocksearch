@@ -7,20 +7,26 @@ As a service: systemctl --user restart stocksearch.service
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import altair as alt
 import pandas as pd
-from nicegui import run, ui
+from dotenv import set_key
+from nicegui import app, run, ui
 
 import db
 import job_state
+import ollama_client
 from config import load_settings
 from logging_config import configure_logging
 from research import run_watchlist
 from tools.yfinance_tools import fetch_trending_etfs, fetch_trending_tickers
+
+ENV_PATH = ".env"
 
 DISCLAIMER = "Not financial advice — informational/research purposes only."
 
@@ -54,19 +60,20 @@ db.init_db(settings.db_path)
 # themselves directly against the actual column around it.
 ui.add_css("nicegui-refreshable { display: contents; }", shared=True)
 
+ui.add_css(
+    """
+@keyframes ticker-scroll { from { transform: translateX(100%); } to { transform: translateX(-100%); } }
+.ticker-tape { overflow: hidden; white-space: nowrap; }
+.ticker-tape span { display: inline-block; animation: ticker-scroll 12s linear infinite; }
+""",
+    shared=True,
+)
+
 GRID_COLUMN_DEFS = [
-    {
-        "field": "ticker",
-        "headerName": "Ticker",
-        "pinned": "left",
-        ":cellRenderer": (
-            "params => `<div>${params.value}"
-            "<div style=\"font-size:0.75em;color:#888;\">${params.data.name || ''}</div></div>`"
-        ),
-    },
+    {"field": "ticker", "headerName": "Ticker", "pinned": "left"},
     {"field": "type", "headerName": "Type"},
     {"field": "sector", "headerName": "Sector/Category"},
-    {"field": "status", "headerName": "Status"},
+    {"field": "status_display", "headerName": "Status"},
     {"field": "short_verdict", "headerName": "Short-term Verdict"},
     {"field": "short_confidence", "headerName": "Short-term Confidence"},
     {"field": "long_verdict", "headerName": "Long-term Verdict"},
@@ -123,6 +130,22 @@ def _fmt_money(v) -> str | None:
         if abs(v) >= div:
             return f"${v / div:.2f}{unit}"
     return f"${v:,.0f}"
+
+
+def _fmt_relative_time(iso_str: str | None) -> str:
+    if not iso_str:
+        return ""
+    dt = datetime.fromisoformat(iso_str)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    seconds = (datetime.now(timezone.utc) - dt).total_seconds()
+    if seconds < 60:
+        return "just now"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m ago"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)}h ago"
+    return f"{int(seconds // 86400)}d ago"
 
 
 def render_key_stats(summaries, overview: dict | None = None) -> None:
@@ -284,6 +307,163 @@ def _run_job_sync(tickers: list[str]) -> None:
         )
 
 
+async def _start_job(tickers: list[str], scan_type: str) -> bool:
+    """Shared by every run button and the overnight scheduler - claims the
+    job slot, runs it in a worker thread, always releases the slot after."""
+    if not tickers or not job_state.try_start(scan_type):
+        return False
+    try:
+        await run.io_bound(_run_job_sync, tickers)
+    finally:
+        job_state.mark_finished()
+    return True
+
+
+async def _gather_everything_tickers() -> list[str]:
+    """Every ticker already in history, plus a fresh trending-stocks pull and
+    a fresh trending-ETFs pull, de-duplicated and with anything already
+    scanned today filtered out. Shared by the "Run everything" button and
+    the overnight scheduler."""
+    with db.connect(settings.db_path) as conn:
+        existing = db.distinct_tickers(conn)
+    try:
+        trending_stocks = await run.io_bound(fetch_trending_tickers, 25)
+    except Exception:  # noqa: BLE001 - a flaky trending-list fetch shouldn't block the run
+        trending_stocks = []
+    try:
+        trending_etfs = await run.io_bound(fetch_trending_etfs, 25)
+    except Exception:  # noqa: BLE001 - same
+        trending_etfs = []
+    tickers = list(dict.fromkeys(existing + trending_stocks + trending_etfs))
+    with db.connect(settings.db_path) as conn:
+        already = db.tickers_scanned_today(conn)
+    return [t for t in tickers if t not in already]
+
+
+def _should_fire_overnight(enabled: bool, scan_time: str, now: datetime, last_fired: date | None) -> bool:
+    """Pure function so the scheduler's timing logic is unit-testable without
+    sleeping or mocking the clock."""
+    if not enabled:
+        return False
+    if now.strftime("%H:%M") != scan_time:
+        return False
+    if last_fired == now.date():
+        return False
+    return True
+
+
+async def _overnight_scan_loop() -> None:
+    """Runs as a background task for the lifetime of the process (registered
+    via app.on_startup, independent of any connected browser tab). Checks
+    the clock once a minute - fine granularity for a once-a-day trigger."""
+    last_fired: date | None = None
+    while True:
+        await asyncio.sleep(60)
+        now = datetime.now().astimezone()
+        if job_state.is_running():
+            continue
+        if not _should_fire_overnight(settings.overnight_scan_enabled, settings.overnight_scan_time, now, last_fired):
+            continue
+        last_fired = now.date()  # mark attempted regardless - a 0-ticker night shouldn't retry all day
+        tickers = await _gather_everything_tickers()
+        if tickers:
+            await _start_job(tickers, "Overnight Scan")
+
+
+def save_settings_field(key: str, value: str, skip_if_blank: bool = False) -> None:
+    if skip_if_blank and not value:
+        return
+    set_key(ENV_PATH, key, value)
+
+
+@ui.page("/settings")
+def settings_page() -> None:
+    app.storage.browser.setdefault("dark_mode", True)
+    dark_mode = ui.dark_mode()
+    dark_mode.bind_value(app.storage.browser, "dark_mode")
+    with ui.row().classes("w-full items-center justify-between"):
+        ui.label("⚙ Settings").classes("text-2xl font-bold")
+        ui.button("Back to Dashboard", icon="arrow_back", on_click=lambda: ui.navigate.to("/")).props("flat")
+
+    ui.label(
+        "Edits .env directly. Saving does not apply immediately - "
+        "restart the service afterward."
+    ).classes("text-xs text-gray-500")
+
+    ui.label("Ollama").classes("font-semibold mt-2")
+    ollama_host_input = ui.input("Ollama Host", value=settings.ollama_host).classes("w-full")
+
+    model_select_container = ui.column().classes("w-full")
+    model_field = None
+
+    def render_model_picker(models: list[str]) -> None:
+        nonlocal model_field
+        model_select_container.clear()
+        with model_select_container:
+            if models:
+                model_field = ui.select(models, value=settings.ollama_model, label="Model").classes("w-64")
+            else:
+                ui.label(
+                    "Could not reach Ollama to list models - enter the model name manually."
+                ).classes("text-xs text-gray-500")
+                model_field = ui.input("Model", value=settings.ollama_model).classes("w-64")
+
+    with model_select_container:
+        model_field = ui.input("Model", value=settings.ollama_model).classes("w-64")
+
+    async def load_models() -> None:
+        models = await run.io_bound(ollama_client.list_models, settings)
+        render_model_picker(models)
+
+    ollama_keep_alive_input = ui.input("Ollama Keep-Alive", value=settings.ollama_keep_alive).classes("w-64")
+    ollama_timeout_input = ui.number(
+        "Ollama Timeout (sec)", value=settings.ollama_timeout_seconds
+    ).classes("w-64")
+
+    ui.label("Sentiment sources").classes("font-semibold mt-2")
+    finnhub_input = ui.input("Finnhub API Key", password=True, placeholder="(unchanged)").classes("w-full")
+    reddit_id_input = ui.input(
+        "Reddit Client ID", password=True, placeholder="(unchanged)"
+    ).classes("w-full")
+    reddit_secret_input = ui.input(
+        "Reddit Client Secret", password=True, placeholder="(unchanged)"
+    ).classes("w-full")
+    subreddits_input = ui.input(
+        "Reddit Subreddits (comma-separated)", value=",".join(settings.reddit_subreddits)
+    ).classes("w-full")
+
+    ui.label("Scanning").classes("font-semibold mt-2")
+    pause_input = ui.number("Ticker Pause (sec)", value=settings.ticker_pause_seconds).classes("w-64")
+    log_level_select = ui.select(
+        ["DEBUG", "INFO", "WARNING", "ERROR"], value=settings.log_level, label="Log Level"
+    ).classes("w-64")
+
+    ui.label("Overnight scan").classes("font-semibold mt-2")
+    overnight_switch = ui.switch("Enabled", value=settings.overnight_scan_enabled)
+    overnight_time = ui.time(value=settings.overnight_scan_time)
+
+    async def on_save_settings_click() -> None:
+        save_settings_field("OLLAMA_HOST", ollama_host_input.value)
+        save_settings_field("OLLAMA_MODEL", model_field.value)
+        save_settings_field("OLLAMA_KEEP_ALIVE", ollama_keep_alive_input.value)
+        save_settings_field("OLLAMA_TIMEOUT_SECONDS", str(ollama_timeout_input.value))
+        save_settings_field("FINNHUB_API_KEY", finnhub_input.value, skip_if_blank=True)
+        save_settings_field("REDDIT_CLIENT_ID", reddit_id_input.value, skip_if_blank=True)
+        save_settings_field("REDDIT_CLIENT_SECRET", reddit_secret_input.value, skip_if_blank=True)
+        save_settings_field("REDDIT_SUBREDDITS", subreddits_input.value)
+        save_settings_field("TICKER_PAUSE_SECONDS", str(pause_input.value))
+        save_settings_field("LOG_LEVEL", log_level_select.value)
+        save_settings_field("OVERNIGHT_SCAN_ENABLED", "true" if overnight_switch.value else "false")
+        save_settings_field("OVERNIGHT_SCAN_TIME", overnight_time.value)
+        ui.notify(
+            "Saved. Restart to apply: systemctl --user restart stocksearch.service",
+            type="positive",
+        )
+
+    ui.button("Save settings", on_click=on_save_settings_click).classes("mt-2")
+    ui.timer(0.1, load_models, once=True)
+
+
 @ui.page("/")
 def main_page() -> None:
     # Lets the results grid grow to fill the rest of the viewport (via
@@ -292,13 +472,21 @@ def main_page() -> None:
     # content above/below the grid ever needs more than one viewport.
     ui.query(".nicegui-content").classes("h-screen")
 
+    app.storage.browser.setdefault("dark_mode", True)
     dark_mode = ui.dark_mode()
+    dark_mode.bind_value(app.storage.browser, "dark_mode")
     with ui.row().classes("w-full items-center justify-between"):
         with ui.column().classes("gap-0"):
             ui.label("📈 stocksearch").classes("text-2xl font-bold")
             ui.label("Agentic fundamentals + sentiment + demand research").classes("text-sm text-gray-500")
-        ui.switch("Dark mode").bind_value(dark_mode)
+        with ui.row().classes("items-center gap-2"):
+            ui.button(icon="settings", on_click=lambda: ui.navigate.to("/settings")).props("flat round")
+            ui.switch("Dark mode").bind_value(dark_mode)
     activity_label = ui.label("").classes("text-sm text-gray-500 italic")
+    ticker_tape = ui.row().classes("ticker-tape w-full")
+    with ticker_tape:
+        ui.label("📈 NVDA +2.1%  ·  AAPL -0.4%  ·  TSLA +1.8%  ·  MSFT +0.6%  ·  SPY +0.3%")
+    ticker_tape.visible = False
     progress_bar = ui.linear_progress(value=0.0, show_value=False).classes("w-full")
     progress_bar.visible = False
     progress_label = ui.label("").classes("text-xs text-gray-500")
@@ -314,13 +502,16 @@ def main_page() -> None:
 
     def set_buttons_disabled(disabled: bool) -> None:
         for b in buttons:
-            b.props("disable" if disabled else "remove=disable")
+            if disabled:
+                b.props("disable")
+            else:
+                b.props(remove="disable")
 
-    async def launch(tickers: list[str]) -> None:
+    async def launch(tickers: list[str], scan_type: str = "Manual") -> None:
         if not tickers:
             ui.notify("Enter at least one ticker.", type="warning")
             return
-        if not job_state.try_start():
+        if job_state.is_running():
             ui.notify("A research job is already running.", type="warning")
             return
         set_buttons_disabled(True)
@@ -328,13 +519,26 @@ def main_page() -> None:
         stop_button.props(remove="disable")
         progress_bar.visible = True
         try:
-            await run.io_bound(_run_job_sync, tickers)
+            await _start_job(tickers, scan_type)
         finally:
-            job_state.mark_finished()
             set_buttons_disabled(False)
             stop_button.visible = False
             progress_bar.visible = False
             refresh_grid()
+
+    async def launch_filtered(tickers: list[str], scan_type: str) -> None:
+        """Like launch(), but for bulk/automated scans - skips any ticker
+        already scanned today instead of always re-running everything."""
+        with db.connect(settings.db_path) as conn:
+            already = db.tickers_scanned_today(conn)
+        skipped = [t for t in tickers if t in already]
+        tickers = [t for t in tickers if t not in already]
+        if skipped:
+            ui.notify(f"Skipping {len(skipped)} already scanned today: {', '.join(skipped)}")
+        if not tickers:
+            ui.notify("Everything found was already scanned today.", type="warning")
+            return
+        await launch(tickers, scan_type)
 
     with ui.tabs() as tabs:
         tab_run = ui.tab("Run Research")
@@ -343,12 +547,12 @@ def main_page() -> None:
         tab_daily = ui.tab("Daily Refresh")
         tab_logs = ui.tab("Logs")
 
-    with ui.tab_panels(tabs, value=tab_run).classes("w-full"):
+    with ui.tab_panels(tabs, value=tab_run).classes("w-full max-h-[45vh] shrink-0 overflow-y-auto"):
         with ui.tab_panel(tab_run):
             ticker_input = ui.input("Ticker(s)", placeholder="e.g. AAPL, TSLA MSFT").classes("w-full")
 
             async def on_run_click() -> None:
-                await launch(_parse_tickers(ticker_input.value))
+                await launch(_parse_tickers(ticker_input.value), "Manual")
 
             run_button = ui.button("Run", on_click=on_run_click)
             buttons.append(run_button)
@@ -370,7 +574,7 @@ def main_page() -> None:
                     ui.notify("No trending stocks found right now.", type="warning")
                     return
                 ui.notify(f"Found {len(tickers)} trending stocks: {', '.join(tickers)}")
-                await launch(tickers)
+                await launch_filtered(tickers, "Screener")
 
             stock_scan_button = ui.button("Scan market", on_click=on_stock_scan_click)
             buttons.append(stock_scan_button)
@@ -397,7 +601,7 @@ def main_page() -> None:
                     ui.notify("No trending ETFs found right now.", type="warning")
                     return
                 ui.notify(f"Found {len(tickers)} trending ETFs: {', '.join(tickers)}")
-                await launch(tickers)
+                await launch_filtered(tickers, "ETF Screener")
 
             etf_scan_button = ui.button("Scan market", on_click=on_etf_scan_click)
             buttons.append(etf_scan_button)
@@ -423,11 +627,31 @@ def main_page() -> None:
                     ui.notify("No tickers in history yet - run some research first.", type="warning")
                     return
                 ui.notify(f"Re-researching {len(tickers)} ticker(s): {', '.join(tickers)}")
-                await launch(tickers)
+                await launch_filtered(tickers, "Daily Refresh")
 
             daily_refresh_button = ui.button("Run all tickers", on_click=on_daily_refresh_click)
             buttons.append(daily_refresh_button)
             refresh_daily_count()
+
+            ui.separator()
+            ui.label(
+                "Runs everything: every ticker already in history, plus a fresh "
+                "trending-stocks pull and a fresh trending-ETFs pull."
+            )
+
+            async def on_run_everything_click() -> None:
+                if job_state.is_running():
+                    ui.notify("A research job is already running.", type="warning")
+                    return
+                tickers = await _gather_everything_tickers()
+                if not tickers:
+                    ui.notify("Nothing to run - everything found was already scanned today.", type="warning")
+                    return
+                ui.notify(f"Researching {len(tickers)} unique ticker(s).")
+                await launch(tickers, "Run Everything")
+
+            run_everything_button = ui.button("Run everything now", on_click=on_run_everything_click)
+            buttons.append(run_everything_button)
 
         with ui.tab_panel(tab_logs):
             log_filter = ui.input("Filter (substring match)").classes("w-full")
@@ -477,8 +701,8 @@ def main_page() -> None:
             "defaultColDef": {"filter": True, "sortable": True, "resizable": True, "floatingFilter": False},
             ":getRowId": "params => params.data.ticker",
             "rowSelection": "single",
+            "autoSizeStrategy": {"type": "fitCellContents"},
         },
-        html_columns=[0],
     ).classes("w-full flex-grow min-h-96")
 
     drawer = ui.right_drawer(value=False, fixed=True, bordered=True).props(
@@ -504,6 +728,9 @@ def main_page() -> None:
         overview = db.parse_overview(summaries) or {}
 
         ui.markdown(f"#### {overview.get('name') or ticker}").classes("w-full break-words")
+        with ui.row().classes("gap-4"):
+            ui.link("TradingView Chart", f"https://www.tradingview.com/chart/?symbol={ticker}", new_tab=True)
+            ui.link("TradingView Overview", f"https://www.tradingview.com/symbols/{ticker}/", new_tab=True)
         subtitle = " · ".join(
             filter(
                 None,
@@ -624,12 +851,17 @@ def main_page() -> None:
 
     grid.on("cellClicked", lambda e: open_detail_panel(e.args["data"]))
 
-    last_rendered_rows: list[dict] | None = None
+    last_rendered_rows: dict[str, dict] | None = None
 
     def refresh_grid() -> None:
         nonlocal last_rendered_rows
         with db.connect(settings.db_path) as conn:
             rows = db.grid_rows(conn)
+
+        for r in rows:
+            r["status_display"] = (
+                _fmt_relative_time(r.get("finished_at")) if r["status"] == "completed" else r["status"]
+            )
 
         for field, _label in FILTER_FIELDS:
             distinct = sorted({r[field] for r in rows if r.get(field)})
@@ -644,22 +876,43 @@ def main_page() -> None:
             if selected:
                 filtered = [r for r in filtered if r.get(field) in selected]
 
-        # ag-Grid's update() destroys and recreates the whole grid instance -
-        # skip it unless the rendered rows actually changed, so a poll tick
-        # with nothing new doesn't reset scroll position/flicker every 1.5s.
-        if filtered == last_rendered_rows:
+        new_by_ticker = {r["ticker"]: r for r in filtered}
+        old_by_ticker = last_rendered_rows or {}
+        if new_by_ticker == old_by_ticker:
             return
-        last_rendered_rows = filtered
-        grid.options["rowData"] = filtered
-        grid.update()
+
+        if last_rendered_rows is None or new_by_ticker.keys() != old_by_ticker.keys():
+            # First load, or the visible SET of tickers changed (a new ticker
+            # appeared, or a filter selection changed what's shown) - ag-Grid's
+            # update() destroys and recreates the whole grid instance, so only
+            # do this when rows are actually being added/removed.
+            last_rendered_rows = new_by_ticker
+            grid.options["rowData"] = filtered
+            grid.update()
+            return
+
+        # Same tickers, but some field changed (e.g. a verdict came in, or the
+        # Status column's relative-time text ticked over a minute boundary) -
+        # update those rows in place via ag-Grid's own transaction API instead
+        # of a full rebuild, so scroll position/filters/selection survive.
+        changed = [new_by_ticker[t] for t in new_by_ticker if new_by_ticker[t] != old_by_ticker.get(t)]
+        last_rendered_rows = new_by_ticker
+        if changed:
+            grid.run_grid_method("applyTransaction", {"update": changed})
+            grid.run_grid_method("autoSizeAllColumns")
 
     def poll_tick() -> None:
         running = job_state.is_running()
         set_buttons_disabled(running)
         stop_button.visible = running
         progress_bar.visible = running
-        activity = job_state.activity_snapshot()
-        activity_label.set_text(" | ".join(f"{t}: {m}" for t, m in activity.items()) if running else "")
+        ticker_tape.visible = running
+        scan_type, current, previous = job_state.activity_snapshot()
+        if running:
+            parts = [f"{t}: {m}" for t, m in filter(None, (previous, current))]
+            activity_label.set_text(f"[{scan_type}] " + " -> ".join(parts))
+        else:
+            activity_label.set_text("")
         completed, total = job_state.progress_snapshot()
         if running and total:
             progress_bar.set_value(completed / total)
@@ -677,4 +930,13 @@ def main_page() -> None:
 
 
 if __name__ in {"__main__", "__mp_main__"}:
-    ui.run(host="0.0.0.0", port=8501, title="stocksearch", reload=False, show=False, uvicorn_logging_level="warning")
+    app.on_startup(_overnight_scan_loop)
+    ui.run(
+        host="0.0.0.0",
+        port=8501,
+        title="stocksearch",
+        reload=False,
+        show=False,
+        uvicorn_logging_level="warning",
+        storage_secret=settings.storage_secret,
+    )

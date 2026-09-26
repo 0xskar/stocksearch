@@ -53,6 +53,19 @@ def _post_chat(settings, messages: list[dict], tools: list[dict] | None = None, 
     return resp.json()["message"]
 
 
+def list_models(settings) -> list[str]:
+    """Names of locally-pulled Ollama models, for the Settings tab's model
+    picker. Returns an empty list (never raises) if Ollama isn't reachable -
+    callers fall back to a plain text field in that case."""
+    try:
+        resp = requests.get(f"{settings.ollama_host}/api/tags", timeout=5)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        logger.warning("Could not list Ollama models: %s", e)
+        return []
+    return [m["name"] for m in resp.json().get("models", [])]
+
+
 def run_agent(
     settings,
     system_prompt: str,

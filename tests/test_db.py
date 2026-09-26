@@ -1,4 +1,5 @@
 import time
+from datetime import datetime, timedelta, timezone
 
 import db
 
@@ -187,3 +188,25 @@ def test_delete_duplicate_ticker_metrics_collapses_consecutive_matches_only(tmp_
             )
         ]
         assert remaining == [100.0, 105.0, 100.0]
+
+
+def test_tickers_scanned_today_uses_local_calendar_date(tmp_path):
+    db_path = str(tmp_path / "test.db")
+    db.init_db(db_path)
+
+    with db.connect(db_path) as conn:
+        run_id = db.start_run(conn, ["AAPL", "MSFT", "TSLA"])
+
+        aapl_run = db.start_ticker_run(conn, run_id, "AAPL")
+        db.finish_ticker_run(conn, aapl_run, "completed")  # finishes "now" - today
+
+        msft_run = db.start_ticker_run(conn, run_id, "MSFT")
+        db.finish_ticker_run(conn, msft_run, "completed")
+        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        conn.execute("UPDATE ticker_runs SET finished_at = ? WHERE id = ?", (yesterday, msft_run))
+
+        tsla_run = db.start_ticker_run(conn, run_id, "TSLA")
+        db.finish_ticker_run(conn, tsla_run, "failed")  # not completed - never counts
+
+        scanned = db.tickers_scanned_today(conn)
+        assert scanned == {"AAPL"}

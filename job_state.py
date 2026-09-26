@@ -13,15 +13,17 @@ import threading
 
 _lock = threading.Lock()
 _running = False
-_activity: dict[str, str] = {}
+_current: tuple[str, str] | None = None
+_previous: tuple[str, str] | None = None
+_scan_type = ""
 _cancel_requested = False
 _total = 0
 _completed = 0
 
 
-def try_start() -> bool:
+def try_start(scan_type: str) -> bool:
     """Atomically claims the single job slot. Returns False if already running."""
-    global _running, _cancel_requested, _total, _completed
+    global _running, _cancel_requested, _total, _completed, _current, _previous, _scan_type
     with _lock:
         if _running:
             return False
@@ -29,7 +31,9 @@ def try_start() -> bool:
         _cancel_requested = False
         _total = 0
         _completed = 0
-        _activity.clear()
+        _current = None
+        _previous = None
+        _scan_type = scan_type
         return True
 
 
@@ -45,13 +49,21 @@ def is_running() -> bool:
 
 
 def note_activity(ticker: str, msg: str) -> None:
+    """Tracks only the current ticker and the one before it (not every ticker
+    ever touched this run) - the results grid already reflects everything
+    permanently, so this caption is deliberately just a short "what's
+    happening right now" glance, not a running log."""
+    global _current, _previous
     with _lock:
-        _activity[ticker] = msg
+        if _current is not None and _current[0] != ticker:
+            _previous = _current
+        _current = (ticker, msg)
 
 
-def activity_snapshot() -> dict[str, str]:
+def activity_snapshot() -> tuple[str, tuple[str, str] | None, tuple[str, str] | None]:
+    """Returns (scan_type, current, previous)."""
     with _lock:
-        return dict(_activity)
+        return _scan_type, _current, _previous
 
 
 def request_cancel() -> None:

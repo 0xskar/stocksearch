@@ -451,7 +451,7 @@ def grid_rows(conn: sqlite3.Connection) -> list[dict]:
     """
     latest = conn.execute(
         """
-        SELECT tr.id AS ticker_run_id, tr.ticker, tr.status, tr.error_message
+        SELECT tr.id AS ticker_run_id, tr.ticker, tr.status, tr.error_message, tr.finished_at
         FROM ticker_runs tr
         INNER JOIN (
             SELECT ticker, MAX(id) AS max_id FROM ticker_runs GROUP BY ticker
@@ -470,10 +470,10 @@ def grid_rows(conn: sqlite3.Connection) -> list[dict]:
             {
                 "ticker_run_id": tr["ticker_run_id"],
                 "ticker": tr["ticker"],
-                "name": overview.get("name") or "",
                 "type": overview.get("quote_type") or "",
                 "sector": overview.get("sector") or overview.get("category") or "",
                 "status": tr["status"],
+                "finished_at": tr["finished_at"],
                 "short_verdict": short["verdict"] if short else "",
                 "short_confidence": short["confidence"] if short else "",
                 "long_verdict": long_["verdict"] if long_ else "",
@@ -481,3 +481,25 @@ def grid_rows(conn: sqlite3.Connection) -> list[dict]:
             }
         )
     return rows
+
+
+def tickers_scanned_today(conn: sqlite3.Connection) -> set[str]:
+    """Tickers whose most recent COMPLETED run finished on today's local
+    calendar date. finished_at is stored in UTC (see now_iso()), so this
+    converts to local time before comparing dates - a naive UTC-string
+    comparison would get the day boundary wrong near local midnight."""
+    today_local = datetime.now().astimezone().date()
+    rows = conn.execute(
+        """
+        SELECT tr.ticker, tr.finished_at
+        FROM ticker_runs tr
+        INNER JOIN (
+            SELECT ticker, MAX(id) AS max_id FROM ticker_runs
+            WHERE status = 'completed' GROUP BY ticker
+        ) m ON tr.ticker = m.ticker AND tr.id = m.max_id
+        """
+    ).fetchall()
+    return {
+        r["ticker"] for r in rows
+        if datetime.fromisoformat(r["finished_at"]).astimezone().date() == today_local
+    }
