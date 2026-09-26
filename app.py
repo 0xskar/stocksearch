@@ -292,8 +292,12 @@ def main_page() -> None:
     # content above/below the grid ever needs more than one viewport.
     ui.query(".nicegui-content").classes("h-screen")
 
-    ui.label("📈 stocksearch").classes("text-2xl font-bold")
-    ui.label("Agentic fundamentals + sentiment + demand research").classes("text-sm text-gray-500")
+    dark_mode = ui.dark_mode()
+    with ui.row().classes("w-full items-center justify-between"):
+        with ui.column().classes("gap-0"):
+            ui.label("📈 stocksearch").classes("text-2xl font-bold")
+            ui.label("Agentic fundamentals + sentiment + demand research").classes("text-sm text-gray-500")
+        ui.switch("Dark mode").bind_value(dark_mode)
     activity_label = ui.label("").classes("text-sm text-gray-500 italic")
     progress_bar = ui.linear_progress(value=0.0, show_value=False).classes("w-full")
     progress_bar.visible = False
@@ -336,6 +340,7 @@ def main_page() -> None:
         tab_run = ui.tab("Run Research")
         tab_screener = ui.tab("Screener")
         tab_etf = ui.tab("ETF Screener")
+        tab_daily = ui.tab("Daily Refresh")
         tab_logs = ui.tab("Logs")
 
     with ui.tab_panels(tabs, value=tab_run).classes("w-full"):
@@ -396,6 +401,33 @@ def main_page() -> None:
 
             etf_scan_button = ui.button("Scan market", on_click=on_etf_scan_click)
             buttons.append(etf_scan_button)
+
+        with ui.tab_panel(tab_daily):
+            ui.label(
+                "Re-researches every ticker already in your history - use this for "
+                "a daily refresh of existing results."
+            )
+            daily_count_label = ui.label("").classes("text-sm text-gray-500")
+
+            def refresh_daily_count() -> None:
+                with db.connect(settings.db_path) as conn:
+                    daily_count_label.set_text(f"{len(db.distinct_tickers(conn))} ticker(s) currently in history.")
+
+            async def on_daily_refresh_click() -> None:
+                if job_state.is_running():
+                    ui.notify("A research job is already running.", type="warning")
+                    return
+                with db.connect(settings.db_path) as conn:
+                    tickers = db.distinct_tickers(conn)
+                if not tickers:
+                    ui.notify("No tickers in history yet - run some research first.", type="warning")
+                    return
+                ui.notify(f"Re-researching {len(tickers)} ticker(s): {', '.join(tickers)}")
+                await launch(tickers)
+
+            daily_refresh_button = ui.button("Run all tickers", on_click=on_daily_refresh_click)
+            buttons.append(daily_refresh_button)
+            refresh_daily_count()
 
         with ui.tab_panel(tab_logs):
             log_filter = ui.input("Filter (substring match)").classes("w-full")
@@ -582,6 +614,7 @@ def main_page() -> None:
                         ).classes("w-full").style("height: 400px")
 
     def open_detail_panel(row_data: dict) -> None:
+        ticker_input.value = row_data["ticker"]
         detail_container.clear()
         with detail_container:
             render_detail(row_data["ticker_run_id"], row_data["ticker"])
