@@ -574,10 +574,12 @@ def main_page() -> None:
                 if s["raw_data_json"]:
                     with ui.expansion("Raw data").classes("w-full max-w-full"):
                         try:
-                            pretty_json = json.dumps(json.loads(s["raw_data_json"]), indent=2)
+                            raw_value = json.loads(s["raw_data_json"])
                         except (TypeError, ValueError):
-                            pretty_json = s["raw_data_json"]
-                        ui.code(pretty_json, language="json").classes("w-full max-w-full overflow-x-auto")
+                            raw_value = s["raw_data_json"]
+                        ui.json_editor(
+                            {"content": {"json": raw_value}, "mode": "tree", "readOnly": True}
+                        ).classes("w-full").style("height: 400px")
 
     def open_detail_panel(row_data: dict) -> None:
         detail_container.clear()
